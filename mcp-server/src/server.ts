@@ -13,6 +13,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { z } from "zod";
 
 const BASE_URL = process.env.BASE_URL || "https://rembro.digitalno.de";
+const SESSION_TTL_MS = parseInt(process.env.SESSION_TTL_MS || String(30 * 60 * 1000)); // 30 min default
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -139,6 +140,7 @@ interface BrowserSession {
   xvfb: ChildProcess;
   x11vnc: ChildProcess;
   createdAt: Date;
+  lastActivity: number; // Date.now() — updated on every tool call
 }
 
 const browserSessions = new Map<string, BrowserSession>();
@@ -251,6 +253,7 @@ async function createBrowserSession(opts: CreateSessionOpts = {}): Promise<Brows
     xvfb,
     x11vnc,
     createdAt: new Date(),
+    lastActivity: Date.now(),
   };
 
   // Wire up structured log listeners for all event types
@@ -329,16 +332,40 @@ async function destroyBrowserSession(id: string): Promise<boolean> {
   const session = browserSessions.get(id);
   if (!session) return false;
 
-  try { await session.page.close().catch(() => {}); } catch {}
-  try { await session.context.close().catch(() => {}); } catch {}
-  try { await session.browser.close().catch(() => {}); } catch {}
-  try { session.x11vnc.kill(); } catch {}
-  try { session.xvfb.kill(); } catch {}
-
+  // Remove from map immediately so concurrent calls don't double-destroy
   browserSessions.delete(id);
+
+  // Close all open pages
+  for (const p of session.pages) {
+    try { if (!p.isClosed()) await p.close().catch(() => {}); } catch {}
+  }
+
+  // Close browser with a timeout — browser.close() can hang if Chromium is unresponsive
+  try {
+    await Promise.race([
+      session.browser.close(),
+      sleep(5000),
+    ]);
+  } catch {}
+
+  // Kill child processes with SIGKILL to ensure they die
+  try { session.x11vnc.kill("SIGKILL"); } catch {}
+  try { session.xvfb.kill("SIGKILL"); } catch {}
+
   console.log(`Session ${id.slice(0, 8)} destroyed`);
   return true;
 }
+
+// Auto-cleanup stale sessions every 60s
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, session] of browserSessions) {
+    if (now - session.lastActivity > SESSION_TTL_MS) {
+      console.log(`Session ${id.slice(0, 8)} expired (inactive for ${Math.floor((now - session.lastActivity) / 1000)}s)`);
+      destroyBrowserSession(id);
+    }
+  }
+}, 60_000);
 
 function sessionToJSON(s: BrowserSession) {
   return {
@@ -349,6 +376,7 @@ function sessionToJSON(s: BrowserSession) {
     currentUrl: s.page.isClosed() ? "(closed)" : s.page.url(),
     createdAt: s.createdAt.toISOString(),
     uptime: Math.floor((Date.now() - s.createdAt.getTime()) / 1000),
+    idleSeconds: Math.floor((Date.now() - s.lastActivity) / 1000),
   };
 }
 
@@ -362,6 +390,7 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
   const getSession = (): BrowserSession => {
     const s = browserSessions.get(browserSessionId);
     if (!s) throw new Error("Browser session not found");
+    s.lastActivity = Date.now();
     return s;
   };
   const getPage = (): Page => {
@@ -1029,6 +1058,12 @@ app.delete("/api/sessions/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
+app.delete("/api/sessions", async (_req, res) => {
+  const ids = Array.from(browserSessions.keys());
+  await Promise.all(ids.map((id) => destroyBrowserSession(id)));
+  res.json({ ok: true, destroyed: ids.length });
+});
+
 // --- SSE log streaming endpoint -----------------------------------------------
 
 app.get("/api/sessions/:id/logs/stream", (req, res) => {
@@ -1152,16 +1187,17 @@ app.get("/", (_req, res) => {
   <div class="card">
     <span class="dot"></span> <strong>Server Online</strong> &mdash; ${sessions.length} active session(s)
     &nbsp;&nbsp;<button class="btn" onclick="createSession()">+ New Session</button>
+    ${sessions.length ? `&nbsp;<button class="btn btn-danger" onclick="killAllSessions()">Kill All</button>` : ""}
   </div>
 
   <div class="card">
     <h3>Sessions</h3>
-    ${sessions.length ? `<table><tr><th>ID</th><th>Browser</th><th>URL</th><th>Age</th><th>Actions</th></tr>
+    ${sessions.length ? `<table><tr><th>ID</th><th>Browser</th><th>URL</th><th>Idle</th><th>Actions</th></tr>
       ${sessions.map(s => `<tr>
         <td><code>${s.id.slice(0, 8)}</code></td>
-        <td>${s.browserType}</td>
+        <td>${s.browserType || "chromium"}</td>
         <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.currentUrl}</td>
-        <td>${s.uptime}s</td>
+        <td>${s.idleSeconds}s</td>
         <td>
           <a class="btn btn-sm" href="${s.vncUrl}" target="_blank">VNC</a>
           <button class="btn btn-sm btn-danger" onclick="deleteSession('${s.id}')">Kill</button>
@@ -1203,6 +1239,11 @@ async function createSession() {
 async function deleteSession(id) {
   if (!confirm('Kill session ' + id.slice(0,8) + '?')) return;
   await fetch('/api/sessions/' + id, { method: 'DELETE' });
+  location.reload();
+}
+async function killAllSessions() {
+  if (!confirm('Kill ALL sessions?')) return;
+  await fetch('/api/sessions', { method: 'DELETE' });
   location.reload();
 }
 </script>
