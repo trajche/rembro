@@ -89,13 +89,47 @@ async function runOCR(imageBuffer: Buffer): Promise<OCRResult> {
 }
 
 // ---------------------------------------------------------------------------
-// Session Manager — each session gets its own Xvfb, x11vnc, and Chromium
+// Session Manager — each session gets its own Xvfb, x11vnc, and browser
 // ---------------------------------------------------------------------------
+
+interface ViewportConfig {
+  width: number;
+  height: number;
+  deviceScaleFactor?: number;
+  isMobile?: boolean;
+  hasTouch?: boolean;
+  userAgent?: string;
+}
+
+const VIEWPORT_PRESETS: Record<string, ViewportConfig> = {
+  "iphone-14":     { width: 390,  height: 844,  deviceScaleFactor: 3,     isMobile: true,  hasTouch: true },
+  "iphone-14-pro": { width: 393,  height: 852,  deviceScaleFactor: 3,     isMobile: true,  hasTouch: true },
+  "pixel-7":       { width: 412,  height: 915,  deviceScaleFactor: 2.625, isMobile: true,  hasTouch: true },
+  "ipad-pro":      { width: 1024, height: 1366, deviceScaleFactor: 2,     isMobile: true,  hasTouch: true },
+  "desktop-hd":    { width: 1280, height: 720 },
+  "desktop-fhd":   { width: 1920, height: 1080 },
+  "desktop-2k":    { width: 2560, height: 1440 },
+  "desktop-4k":    { width: 3840, height: 2160 },
+};
+
+interface CreateSessionOpts {
+  browser?: "chromium" | "firefox" | "webkit";
+  viewport?: { preset?: string } | { device?: string } | { width: number; height: number; deviceScaleFactor?: number; isMobile?: boolean; hasTouch?: boolean; userAgent?: string };
+  chromeArgs?: string[];
+  proxy?: { server: string; bypass?: string; username?: string; password?: string };
+  colorScheme?: "light" | "dark" | "no-preference";
+  locale?: string;
+  timezoneId?: string;
+  geolocation?: { latitude: number; longitude: number; accuracy?: number };
+  userAgent?: string;
+}
 
 interface BrowserSession {
   id: string;
   displayNum: number;
   vncPort: number;
+  browserType: string;
+  viewport: ViewportConfig;
   browser: Browser;
   context: BrowserContext;
   page: Page;
@@ -114,13 +148,52 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function createBrowserSession(): Promise<BrowserSession> {
+function getBrowserType(name: string): BrowserType {
+  switch (name) {
+    case "firefox": return firefox;
+    case "webkit": return webkit;
+    case "chromium":
+    default: return chromium;
+  }
+}
+
+function resolveViewport(opts?: CreateSessionOpts["viewport"]): ViewportConfig {
+  if (!opts) return { ...VIEWPORT_PRESETS["desktop-hd"] };
+
+  if ("preset" in opts && opts.preset) {
+    const preset = VIEWPORT_PRESETS[opts.preset];
+    if (!preset) throw new Error(`Unknown viewport preset: ${opts.preset}. Available: ${Object.keys(VIEWPORT_PRESETS).join(", ")}`);
+    return { ...preset };
+  }
+
+  if ("device" in opts && opts.device) {
+    const preset = VIEWPORT_PRESETS[opts.device];
+    if (!preset) throw new Error(`Unknown device: ${opts.device}. Available: ${Object.keys(VIEWPORT_PRESETS).join(", ")}`);
+    return { ...preset };
+  }
+
+  if ("width" in opts && "height" in opts) {
+    return { width: opts.width, height: opts.height, deviceScaleFactor: opts.deviceScaleFactor, isMobile: opts.isMobile, hasTouch: opts.hasTouch, userAgent: opts.userAgent };
+  }
+
+  return { ...VIEWPORT_PRESETS["desktop-hd"] };
+}
+
+async function createBrowserSession(opts: CreateSessionOpts = {}): Promise<BrowserSession> {
   const id = randomUUID();
   const displayNum = nextDisplayNum++;
   const vncPort = 5900 + displayNum; // e.g. display :100 -> port 6000
 
+  const browserTypeName = opts.browser ?? "chromium";
+  const browserType = getBrowserType(browserTypeName);
+  const viewport = resolveViewport(opts.viewport);
+
+  // Xvfb resolution: at least 1920x1080, or match viewport if larger
+  const xvfbWidth = Math.max(viewport.width, 1920);
+  const xvfbHeight = Math.max(viewport.height, 1080);
+
   // Start Xvfb
-  const xvfb = spawn("Xvfb", [`:${displayNum}`, "-screen", "0", "1280x720x24", "-ac"], {
+  const xvfb = spawn("Xvfb", [`:${displayNum}`, "-screen", "0", `${xvfbWidth}x${xvfbHeight}x24`, "-ac"], {
     stdio: "ignore",
   });
   await sleep(500);
@@ -133,19 +206,42 @@ async function createBrowserSession(): Promise<BrowserSession> {
   );
   await sleep(300);
 
-  // Launch Chromium on this display
-  const browser = await chromium.launch({
+  // Build browser launch args
+  const launchArgs: string[] = [];
+  if (browserTypeName === "chromium") {
+    launchArgs.push("--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu");
+    if (opts.chromeArgs) launchArgs.push(...opts.chromeArgs);
+  }
+
+  // Launch browser on this display
+  const browser = await browserType.launch({
     headless: false,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"],
+    args: launchArgs.length > 0 ? launchArgs : undefined,
+    proxy: opts.proxy ? { server: opts.proxy.server, bypass: opts.proxy.bypass, username: opts.proxy.username, password: opts.proxy.password } : undefined,
     env: { ...process.env, DISPLAY: `:${displayNum}` } as Record<string, string>,
   });
-  const context = await browser.newContext({ viewport: { width: 1280, height: 720 } });
+
+  const contextOpts: Record<string, unknown> = {
+    viewport: { width: viewport.width, height: viewport.height },
+  };
+  if (viewport.deviceScaleFactor) contextOpts.deviceScaleFactor = viewport.deviceScaleFactor;
+  if (viewport.isMobile) contextOpts.isMobile = viewport.isMobile;
+  if (viewport.hasTouch) contextOpts.hasTouch = viewport.hasTouch;
+  if (opts.colorScheme) contextOpts.colorScheme = opts.colorScheme;
+  if (opts.locale) contextOpts.locale = opts.locale;
+  if (opts.timezoneId) contextOpts.timezoneId = opts.timezoneId;
+  if (opts.geolocation) contextOpts.geolocation = opts.geolocation;
+  if (opts.userAgent || viewport.userAgent) contextOpts.userAgent = opts.userAgent ?? viewport.userAgent;
+
+  const context = await browser.newContext(contextOpts);
   const page = await context.newPage();
 
   const session: BrowserSession = {
     id,
     displayNum,
     vncPort,
+    browserType: browserTypeName,
+    viewport,
     browser,
     context,
     page,
@@ -225,7 +321,7 @@ async function createBrowserSession(): Promise<BrowserSession> {
   });
 
   browserSessions.set(id, session);
-  console.log(`Session ${id.slice(0, 8)} created (display :${displayNum}, vnc port ${vncPort})`);
+  console.log(`Session ${id.slice(0, 8)} created (${browserTypeName}, display :${displayNum}, vnc port ${vncPort}, viewport ${viewport.width}x${viewport.height})`);
   return session;
 }
 
@@ -247,6 +343,8 @@ async function destroyBrowserSession(id: string): Promise<boolean> {
 function sessionToJSON(s: BrowserSession) {
   return {
     id: s.id,
+    browserType: s.browserType,
+    viewport: { width: s.viewport.width, height: s.viewport.height, deviceScaleFactor: s.viewport.deviceScaleFactor, isMobile: s.viewport.isMobile },
     vncUrl: `${BASE_URL}/vnc/${s.id}`,
     currentUrl: s.page.isClosed() ? "(closed)" : s.page.url(),
     createdAt: s.createdAt.toISOString(),
@@ -259,7 +357,7 @@ function sessionToJSON(s: BrowserSession) {
 // ---------------------------------------------------------------------------
 
 function createMcpServer(mcpSessionId: string, browserSessionId: string): McpServer {
-  const server = new McpServer({ name: "remotebrowser-mcp", version: "0.2.0" });
+  const server = new McpServer({ name: "remotebrowser-mcp", version: "0.3.0" });
 
   const getSession = (): BrowserSession => {
     const s = browserSessions.get(browserSessionId);
@@ -274,9 +372,57 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
 
   // ---- Session management --------------------------------------------------
 
-  server.tool("create_session", {}, async () => {
+  server.tool("create_session", {
+    browser: z.enum(["chromium", "firefox", "webkit"]).optional().describe("Browser engine to use (default: chromium)"),
+    viewport_preset: z.string().optional().describe("Viewport preset name (e.g. iphone-14, desktop-fhd)"),
+    viewport_device: z.string().optional().describe("Device name for viewport (alias for preset)"),
+    viewport_width: z.number().int().positive().optional().describe("Custom viewport width in pixels"),
+    viewport_height: z.number().int().positive().optional().describe("Custom viewport height in pixels"),
+    viewport_scale: z.number().positive().optional().describe("Device scale factor"),
+    viewport_mobile: z.boolean().optional().describe("Emulate mobile device"),
+    viewport_touch: z.boolean().optional().describe("Enable touch events"),
+    chrome_args: z.array(z.string()).optional().describe("Extra Chrome launch arguments"),
+    proxy_server: z.string().optional().describe("Proxy server URL"),
+    proxy_bypass: z.string().optional().describe("Proxy bypass list"),
+    proxy_username: z.string().optional().describe("Proxy auth username"),
+    proxy_password: z.string().optional().describe("Proxy auth password"),
+    color_scheme: z.enum(["light", "dark", "no-preference"]).optional().describe("Preferred color scheme"),
+    locale: z.string().optional().describe("Browser locale (e.g. en-US)"),
+    timezone_id: z.string().optional().describe("Timezone (e.g. America/New_York)"),
+    geo_latitude: z.number().optional().describe("Geolocation latitude"),
+    geo_longitude: z.number().optional().describe("Geolocation longitude"),
+    geo_accuracy: z.number().optional().describe("Geolocation accuracy in meters"),
+    user_agent: z.string().optional().describe("Custom user agent string"),
+  }, async (params) => {
     try {
-      const s = await createBrowserSession();
+      const opts: CreateSessionOpts = {};
+      if (params.browser) opts.browser = params.browser;
+      if (params.viewport_preset) {
+        opts.viewport = { preset: params.viewport_preset };
+      } else if (params.viewport_device) {
+        opts.viewport = { device: params.viewport_device };
+      } else if (params.viewport_width && params.viewport_height) {
+        opts.viewport = {
+          width: params.viewport_width,
+          height: params.viewport_height,
+          deviceScaleFactor: params.viewport_scale,
+          isMobile: params.viewport_mobile,
+          hasTouch: params.viewport_touch,
+        };
+      }
+      if (params.chrome_args) opts.chromeArgs = params.chrome_args;
+      if (params.proxy_server) {
+        opts.proxy = { server: params.proxy_server, bypass: params.proxy_bypass, username: params.proxy_username, password: params.proxy_password };
+      }
+      if (params.color_scheme) opts.colorScheme = params.color_scheme;
+      if (params.locale) opts.locale = params.locale;
+      if (params.timezone_id) opts.timezoneId = params.timezone_id;
+      if (params.geo_latitude !== undefined && params.geo_longitude !== undefined) {
+        opts.geolocation = { latitude: params.geo_latitude, longitude: params.geo_longitude, accuracy: params.geo_accuracy };
+      }
+      if (params.user_agent) opts.userAgent = params.user_agent;
+
+      const s = await createBrowserSession(opts);
       return { content: [{ type: "text", text: JSON.stringify(sessionToJSON(s), null, 2) }] };
     } catch (e: unknown) {
       return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
@@ -286,6 +432,40 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
   server.tool("list_sessions", {}, async () => {
     const list = Array.from(browserSessions.values()).map(sessionToJSON);
     return { content: [{ type: "text", text: JSON.stringify(list, null, 2) }] };
+  });
+
+  server.tool("list_viewport_presets", {}, async () => {
+    const presets = Object.entries(VIEWPORT_PRESETS).map(([name, config]) => ({ name, ...config }));
+    return { content: [{ type: "text", text: JSON.stringify(presets, null, 2) }] };
+  });
+
+  server.tool("set_viewport", {
+    preset: z.string().optional().describe("Viewport preset name"),
+    width: z.number().int().positive().optional().describe("Custom width in pixels"),
+    height: z.number().int().positive().optional().describe("Custom height in pixels"),
+  }, async (params) => {
+    try {
+      const s = getSession();
+      let width: number;
+      let height: number;
+      if (params.preset) {
+        const preset = VIEWPORT_PRESETS[params.preset];
+        if (!preset) throw new Error(`Unknown preset: ${params.preset}. Available: ${Object.keys(VIEWPORT_PRESETS).join(", ")}`);
+        width = preset.width;
+        height = preset.height;
+        s.viewport = { ...preset };
+      } else if (params.width && params.height) {
+        width = params.width;
+        height = params.height;
+        s.viewport = { width, height };
+      } else {
+        throw new Error("Provide either a preset name or both width and height");
+      }
+      await s.page.setViewportSize({ width, height });
+      return { content: [{ type: "text", text: `Viewport set to ${width}x${height}` }] };
+    } catch (e: unknown) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
   });
 
   server.tool("get_session_info", {}, async () => {
@@ -581,6 +761,210 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
+  // ---- Cookie Management ----------------------------------------------------
+
+  server.tool("get_cookies", {
+    urls: z.array(z.string()).optional().describe("Filter cookies by URLs"),
+  }, async ({ urls }) => {
+    try {
+      const ctx = getSession().context;
+      const cookies = urls ? await ctx.cookies(urls) : await ctx.cookies();
+      return { content: [{ type: "text", text: JSON.stringify(cookies, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("set_cookies", {
+    cookies: z.array(z.object({
+      name: z.string(),
+      value: z.string(),
+      domain: z.string().optional(),
+      path: z.string().optional().default("/"),
+      expires: z.number().optional(),
+      httpOnly: z.boolean().optional(),
+      secure: z.boolean().optional(),
+      sameSite: z.enum(["Strict", "Lax", "None"]).optional(),
+      url: z.string().optional(),
+    })),
+  }, async ({ cookies }) => {
+    try {
+      await getSession().context.addCookies(cookies);
+      return { content: [{ type: "text", text: `Set ${cookies.length} cookie(s)` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("clear_cookies", {}, async () => {
+    try {
+      await getSession().context.clearCookies();
+      return { content: [{ type: "text", text: "Cookies cleared" }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  // ---- Storage Management ---------------------------------------------------
+
+  server.tool("get_storage", {
+    type: z.enum(["localStorage", "sessionStorage"]).default("localStorage"),
+    keys: z.array(z.string()).optional().describe("Specific keys to retrieve (omit for all)"),
+  }, async ({ type, keys }) => {
+    try {
+      const page = getPage();
+      const data = await page.evaluate(({ storageType, filterKeys }) => {
+        const storage = storageType === "localStorage" ? localStorage : sessionStorage;
+        const result: Record<string, string> = {};
+        if (filterKeys) {
+          for (const key of filterKeys) {
+            const val = storage.getItem(key);
+            if (val !== null) result[key] = val;
+          }
+        } else {
+          for (let i = 0; i < storage.length; i++) {
+            const key = storage.key(i)!;
+            result[key] = storage.getItem(key)!;
+          }
+        }
+        return result;
+      }, { storageType: type, filterKeys: keys });
+      return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("set_storage", {
+    type: z.enum(["localStorage", "sessionStorage"]).default("localStorage"),
+    entries: z.record(z.string(), z.string()).describe("Key-value pairs to set"),
+  }, async ({ type, entries }) => {
+    try {
+      const page = getPage();
+      await page.evaluate(({ storageType, data }) => {
+        const storage = storageType === "localStorage" ? localStorage : sessionStorage;
+        for (const [key, value] of Object.entries(data) as [string, string][]) {
+          storage.setItem(key, value);
+        }
+      }, { storageType: type, data: entries });
+      return { content: [{ type: "text", text: `Set ${Object.keys(entries).length} ${type} entries` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  // ---- Multi-Tab / Multi-Page -----------------------------------------------
+
+  server.tool("list_pages", {}, async () => {
+    try {
+      const session = getSession();
+      const pages: { index: number; url: string; title: string; isActive: boolean }[] = [];
+      for (let i = 0; i < session.pages.length; i++) {
+        const p = session.pages[i];
+        if (p.isClosed()) {
+          pages.push({ index: i, url: "(closed)", title: "(closed)", isActive: i === session.activePageIndex });
+        } else {
+          let title = "";
+          try { title = await p.title(); } catch { title = "(error)"; }
+          pages.push({ index: i, url: p.url(), title, isActive: i === session.activePageIndex });
+        }
+      }
+      return { content: [{ type: "text", text: JSON.stringify(pages, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("switch_page", {
+    index: z.number().int().min(0).describe("Page index to switch to"),
+  }, async ({ index }) => {
+    try {
+      const session = getSession();
+      if (index >= session.pages.length || session.pages[index].isClosed()) {
+        throw new Error(`Page ${index} not available`);
+      }
+      session.activePageIndex = index;
+      session.page = session.pages[index];
+      const url = session.page.url();
+      return { content: [{ type: "text", text: `Switched to page ${index}: ${url}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("new_page", {
+    url: z.string().optional().describe("URL to navigate to (omit for blank page)"),
+  }, async ({ url }) => {
+    try {
+      const session = getSession();
+      const newPage = await session.context.newPage();
+      session.pages.push(newPage);
+      session.activePageIndex = session.pages.length - 1;
+      session.page = newPage;
+      newPage.on("console", (msg) => {
+        addLog(session.logs, { category: "console", level: msg.type() as LogEntry["level"], message: msg.text(), metadata: { location: msg.location() } });
+      });
+      if (url) await newPage.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      return { content: [{ type: "text", text: `New page created (index ${session.pages.length - 1})${url ? `: ${url}` : ""}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("close_page", {
+    index: z.number().int().min(0).optional().describe("Page index to close (defaults to active page)"),
+  }, async ({ index }) => {
+    try {
+      const session = getSession();
+      const target = index ?? session.activePageIndex;
+      if (target >= session.pages.length) throw new Error(`Page ${target} not found`);
+      if (session.pages.length <= 1) throw new Error("Cannot close the last page");
+
+      await session.pages[target].close();
+      session.pages.splice(target, 1);
+
+      if (session.activePageIndex >= session.pages.length) {
+        session.activePageIndex = session.pages.length - 1;
+      }
+      session.page = session.pages[session.activePageIndex];
+
+      return { content: [{ type: "text", text: `Closed page ${target}. Active page is now ${session.activePageIndex}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  // ---- Auth State Save/Restore ----------------------------------------------
+
+  server.tool("save_auth_state", {}, async () => {
+    try {
+      const session = getSession();
+      const state = await session.context.storageState();
+      return { content: [{ type: "text", text: JSON.stringify(state) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("restore_auth_state", {
+    state: z.string().describe("JSON string of auth state from save_auth_state"),
+  }, async ({ state }) => {
+    try {
+      const session = getSession();
+      const parsed = JSON.parse(state);
+      const browser = session.browser;
+      if (!browser) throw new Error("Cannot restore auth state on persistent context sessions");
+
+      // Close old context
+      await session.page.close().catch(() => {});
+      await session.context.close().catch(() => {});
+
+      // Create new context with saved state
+      const newContext = await browser.newContext({
+        viewport: { width: 1280, height: 720 },
+        storageState: parsed,
+      });
+      const newPage = await newContext.newPage();
+
+      session.context = newContext;
+      session.page = newPage;
+      session.pages = [newPage];
+      session.activePageIndex = 0;
+
+      newPage.on("console", (msg) => {
+        addLog(session.logs, { category: "console", level: msg.type() as LogEntry["level"], message: msg.text(), metadata: { location: msg.location() } });
+      });
+      newContext.on("page", (p) => {
+        session.pages.push(p);
+        p.on("console", (msg) => {
+          addLog(session.logs, { category: "console", level: msg.type() as LogEntry["level"], message: msg.text(), metadata: { location: msg.location() } });
+        });
+      });
+
+      return { content: [{ type: "text", text: "Auth state restored. New context created with saved cookies and storage." }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
   return server;
 }
 
@@ -608,9 +992,21 @@ app.get("/health", (_req, res) => {
 
 // --- REST API for session management ----------------------------------------
 
-app.post("/api/sessions", async (_req, res) => {
+app.post("/api/sessions", async (req, res) => {
   try {
-    const s = await createBrowserSession();
+    const body = req.body ?? {};
+    const opts: CreateSessionOpts = {};
+    if (body.browser) opts.browser = body.browser;
+    if (body.viewport) opts.viewport = body.viewport;
+    if (body.chromeArgs) opts.chromeArgs = body.chromeArgs;
+    if (body.proxy) opts.proxy = body.proxy;
+    if (body.colorScheme) opts.colorScheme = body.colorScheme;
+    if (body.locale) opts.locale = body.locale;
+    if (body.timezoneId) opts.timezoneId = body.timezoneId;
+    if (body.geolocation) opts.geolocation = body.geolocation;
+    if (body.userAgent) opts.userAgent = body.userAgent;
+
+    const s = await createBrowserSession(opts);
     res.json(sessionToJSON(s));
   } catch (e: unknown) {
     res.status(500).json({ error: (e as Error).message });
@@ -760,10 +1156,11 @@ app.get("/", (_req, res) => {
 
   <div class="card">
     <h3>Sessions</h3>
-    ${sessions.length ? `<table><tr><th>ID</th><th>URL</th><th>Age</th><th>Actions</th></tr>
+    ${sessions.length ? `<table><tr><th>ID</th><th>Browser</th><th>URL</th><th>Age</th><th>Actions</th></tr>
       ${sessions.map(s => `<tr>
         <td><code>${s.id.slice(0, 8)}</code></td>
-        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.currentUrl}</td>
+        <td>${s.browserType}</td>
+        <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.currentUrl}</td>
         <td>${s.uptime}s</td>
         <td>
           <a class="btn btn-sm" href="${s.vncUrl}" target="_blank">VNC</a>

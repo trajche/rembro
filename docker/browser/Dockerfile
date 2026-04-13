@@ -14,8 +14,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Playwright's bundled Chromium with dependencies
-RUN npx playwright install chromium --with-deps
+# Tesseract OCR
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Playwright browsers with dependencies
+RUN npx playwright install chromium --with-deps && \
+    npx playwright install firefox --with-deps && \
+    npx playwright install webkit --with-deps
 
 # SSH setup
 RUN mkdir -p /run/sshd && \
