@@ -2,7 +2,7 @@ import express from "express";
 import { randomUUID } from "crypto";
 import { createServer } from "http";
 import { spawn, execFile, type ChildProcess } from "child_process";
-import { readFileSync, writeFileSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, rmSync, statSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import net from "net";
@@ -113,6 +113,16 @@ const VIEWPORT_PRESETS: Record<string, ViewportConfig> = {
   "desktop-4k":    { width: 3840, height: 2160 },
 };
 
+interface DownloadInfo {
+  id: number;
+  filename: string;
+  url: string;
+  path: string;
+  size: number;
+  mimeType: string;
+  timestamp: number;
+}
+
 interface CreateSessionOpts {
   browser?: "chromium" | "firefox" | "webkit";
   viewport?: { preset?: string } | { device?: string } | { width: number; height: number; deviceScaleFactor?: number; isMobile?: boolean; hasTouch?: boolean; userAgent?: string };
@@ -137,6 +147,18 @@ interface BrowserSession {
   pages: Page[];
   activePageIndex: number;
   logs: SessionLogStore;
+  downloads: DownloadInfo[];
+  nextDownloadId: number;
+  isRecording: boolean;
+  harRecordingPath?: string;
+  harEntries?: Array<{
+    request: { method: string; url: string; headers: Array<{name: string; value: string}>; postData?: { text: string; mimeType: string } };
+    response: { status: number; statusText: string; headers: Array<{name: string; value: string}>; content: { size: number; mimeType: string; text?: string } };
+    startedDateTime: string;
+    time: number;
+  }>;
+  harRequestHandler?: (request: any) => void;
+  harResponseHandler?: (response: any) => void;
   xvfb: ChildProcess;
   x11vnc: ChildProcess;
   createdAt: Date;
@@ -250,6 +272,8 @@ async function createBrowserSession(opts: CreateSessionOpts = {}): Promise<Brows
     pages: [page],
     activePageIndex: 0,
     logs: createLogStore(),
+    downloads: [],
+    nextDownloadId: 1,
     xvfb,
     x11vnc,
     createdAt: new Date(),
@@ -314,6 +338,27 @@ async function createBrowserSession(opts: CreateSessionOpts = {}): Promise<Brows
         },
       });
     });
+
+    p.on("download", async (download) => {
+      const filename = download.suggestedFilename();
+      const savePath = `/tmp/downloads/${session.id}/${filename}`;
+      try {
+        mkdirSync(`/tmp/downloads/${session.id}`, { recursive: true });
+        await download.saveAs(savePath);
+        const stat = statSync(savePath);
+        session.downloads.push({
+          id: session.nextDownloadId++,
+          filename,
+          url: download.url(),
+          path: savePath,
+          size: stat.size,
+          mimeType: "",
+          timestamp: Date.now(),
+        });
+      } catch (e) {
+        console.log(`Download failed: ${filename} — ${(e as Error).message}`);
+      }
+    });
   };
 
   wirePageLogListeners(page);
@@ -351,6 +396,9 @@ async function destroyBrowserSession(id: string): Promise<boolean> {
   // Kill child processes with SIGKILL to ensure they die
   try { session.x11vnc.kill("SIGKILL"); } catch {}
   try { session.xvfb.kill("SIGKILL"); } catch {}
+
+  // Clean up downloads
+  try { rmSync(`/tmp/downloads/${id}`, { recursive: true, force: true }); } catch {}
 
   console.log(`Session ${id.slice(0, 8)} destroyed`);
   return true;
@@ -991,6 +1039,75 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
       });
 
       return { content: [{ type: "text", text: "Auth state restored. New context created with saved cookies and storage." }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  // ---- File downloads -------------------------------------------------------
+
+  server.tool("get_downloads", {}, async () => {
+    try {
+      const session = getSession();
+      return { content: [{ type: "text", text: JSON.stringify(session.downloads, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("get_download_content", {
+    id: z.number().int().describe("Download ID from get_downloads"),
+    encoding: z.enum(["base64", "text"]).optional().default("base64").describe("Encoding for the file content"),
+  }, async ({ id, encoding }) => {
+    try {
+      const session = getSession();
+      const dl = session.downloads.find(d => d.id === id);
+      if (!dl) throw new Error(`Download ${id} not found`);
+
+      const buf = readFileSync(dl.path);
+
+      if (encoding === "text") {
+        return { content: [{ type: "text", text: buf.toString("utf-8") }] };
+      }
+      // Return as base64 — check if it looks like an image
+      const ext = dl.filename.split(".").pop()?.toLowerCase();
+      const imageExts = ["png", "jpg", "jpeg", "gif", "webp", "svg"];
+      if (imageExts.includes(ext || "")) {
+        const mimeMap: Record<string, string> = { png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", webp: "image/webp", svg: "image/svg+xml" };
+        return { content: [{ type: "image", data: buf.toString("base64"), mimeType: mimeMap[ext!] || "application/octet-stream" }] };
+      }
+      return { content: [{ type: "text", text: buf.toString("base64") }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("wait_for_download", {
+    action: z.enum(["click"]).describe("Action to trigger the download"),
+    selector: z.string().describe("CSS selector for the element to interact with"),
+    timeout: z.number().int().positive().max(30000).optional().default(10000).describe("Timeout in ms to wait for the download"),
+  }, async ({ action, selector, timeout }) => {
+    try {
+      const page = getPage();
+      const session = getSession();
+
+      const [download] = await Promise.all([
+        page.waitForEvent("download", { timeout }),
+        page.click(selector),
+      ]);
+
+      const filename = download.suggestedFilename();
+      const savePath = `/tmp/downloads/${session.id}/${filename}`;
+      mkdirSync(`/tmp/downloads/${session.id}`, { recursive: true });
+      await download.saveAs(savePath);
+
+      const stat = statSync(savePath);
+      const info: DownloadInfo = {
+        id: session.nextDownloadId++,
+        filename,
+        url: download.url(),
+        path: savePath,
+        size: stat.size,
+        mimeType: "",
+        timestamp: Date.now(),
+      };
+      session.downloads.push(info);
+
+      return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
