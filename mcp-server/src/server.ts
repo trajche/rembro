@@ -1390,6 +1390,132 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
+  // ---------------------------------------------------------------------------
+  // Network interception / mocking
+  // ---------------------------------------------------------------------------
+
+  server.tool("mock_route", {
+    pattern: z.string().describe("URL pattern to match (glob, e.g. '**/api/users*')"),
+    status: z.number().int().optional().default(200),
+    body: z.string().describe("Response body (JSON string, HTML, or plain text)"),
+    contentType: z.string().optional().default("application/json"),
+    headers: z.record(z.string(), z.string()).optional(),
+  }, async ({ pattern, status, body, contentType, headers }) => {
+    try {
+      const page = getPage();
+      const session = getSession();
+
+      await page.route(pattern, (route) => {
+        route.fulfill({
+          status,
+          body,
+          contentType,
+          headers: headers ?? {},
+        });
+      });
+
+      const routeId = session.nextRouteId++;
+      session.activeRoutes.push({ id: routeId, pattern, type: "mock" });
+
+      return { content: [{ type: "text", text: `Route #${routeId} mocked: ${pattern} → ${status} ${contentType}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("block_route", {
+    pattern: z.string().describe("URL pattern to block (glob, e.g. '**/*.png' or '**/analytics*')"),
+  }, async ({ pattern }) => {
+    try {
+      const page = getPage();
+      const session = getSession();
+
+      await page.route(pattern, (route) => {
+        route.abort();
+      });
+
+      const routeId = session.nextRouteId++;
+      session.activeRoutes.push({ id: routeId, pattern, type: "block" });
+
+      return { content: [{ type: "text", text: `Route #${routeId} blocked: ${pattern}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("list_routes", {}, async () => {
+    try {
+      const session = getSession();
+      return { content: [{ type: "text", text: JSON.stringify(session.activeRoutes, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("clear_routes", {}, async () => {
+    try {
+      const page = getPage();
+      const session = getSession();
+
+      await page.unrouteAll({ behavior: "wait" });
+
+      const count = session.activeRoutes.length;
+      session.activeRoutes = [];
+
+      return { content: [{ type: "text", text: `Cleared ${count} route(s)` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  // ---------------------------------------------------------------------------
+  // PDF generation (via CDP for headed Chromium)
+  // ---------------------------------------------------------------------------
+
+  server.tool("save_pdf", {
+    format: z.enum(["A4", "Letter", "Legal", "A3"]).optional().default("A4"),
+    landscape: z.boolean().optional().default(false),
+    printBackground: z.boolean().optional().default(true),
+    scale: z.number().min(0.1).max(2).optional().default(1),
+    margin: z.object({
+      top: z.string().optional().default("0.5in"),
+      bottom: z.string().optional().default("0.5in"),
+      left: z.string().optional().default("0.5in"),
+      right: z.string().optional().default("0.5in"),
+    }).optional(),
+  }, async ({ format, landscape, printBackground, scale, margin }) => {
+    try {
+      const page = getPage();
+      const session = getSession();
+
+      if (session.browserType !== "chromium") {
+        return { content: [{ type: "text", text: "PDF generation is only supported with Chromium browser" }], isError: true };
+      }
+
+      const parseMarginInches = (val: string): number => {
+        const num = parseFloat(val);
+        if (isNaN(num)) return 0.5;
+        return num;
+      };
+
+      const paperDimensions: Record<string, { width: number; height: number }> = {
+        A4: { width: 8.27, height: 11.69 },
+        A3: { width: 11.69, height: 16.54 },
+        Letter: { width: 8.5, height: 11 },
+        Legal: { width: 8.5, height: 14 },
+      };
+      const paper = paperDimensions[format] || paperDimensions.A4;
+
+      const cdpSession = await page.context().newCDPSession(page);
+      const result = await cdpSession.send("Page.printToPDF", {
+        landscape,
+        printBackground,
+        scale,
+        paperWidth: paper.width,
+        paperHeight: paper.height,
+        marginTop: parseMarginInches(margin?.top || "0.5in"),
+        marginBottom: parseMarginInches(margin?.bottom || "0.5in"),
+        marginLeft: parseMarginInches(margin?.left || "0.5in"),
+        marginRight: parseMarginInches(margin?.right || "0.5in"),
+      });
+      await cdpSession.detach();
+
+      return { content: [{ type: "text", text: `data:application/pdf;base64,${(result as any).data}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error generating PDF: ${(e as Error).message}. PDF generation requires Chromium.` }], isError: true }; }
+  });
+
   return server;
 }
 
