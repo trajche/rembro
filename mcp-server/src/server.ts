@@ -1,10 +1,12 @@
 import express from "express";
 import { randomUUID } from "crypto";
 import { createServer } from "http";
-import { spawn, type ChildProcess } from "child_process";
-import { readFileSync } from "fs";
+import { spawn, execFile, type ChildProcess } from "child_process";
+import { readFileSync, writeFileSync, unlinkSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import net from "net";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { chromium, firefox, webkit, type Browser, type BrowserContext, type Page, type BrowserType } from "playwright";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { WebSocketServer, WebSocket } from "ws";
@@ -12,6 +14,79 @@ import { z } from "zod";
 
 const BASE_URL = process.env.BASE_URL || "https://rembro.digitalno.de";
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Structured log types
+// ---------------------------------------------------------------------------
+
+interface LogEntry {
+  id: number;
+  timestamp: number;
+  category: "console" | "network" | "pageerror" | "performance";
+  level: "debug" | "info" | "warn" | "error" | "log";
+  message: string;
+  metadata?: Record<string, unknown>;
+}
+
+interface SessionLogStore {
+  entries: LogEntry[];
+  nextId: number;
+  maxEntries: number;
+  listeners: Array<(entry: LogEntry) => void>;
+}
+
+function createLogStore(maxEntries = 1000): SessionLogStore {
+  return { entries: [], nextId: 1, maxEntries, listeners: [] };
+}
+
+function addLog(store: SessionLogStore, entry: Omit<LogEntry, "id" | "timestamp">): void {
+  const full: LogEntry = { ...entry, id: store.nextId++, timestamp: Date.now() };
+  store.entries.push(full);
+  if (store.entries.length > store.maxEntries) {
+    store.entries.shift(); // ring buffer behavior
+  }
+  for (const listener of store.listeners) {
+    try { listener(full); } catch {}
+  }
+}
+
+// ---------------------------------------------------------------------------
+// OCR helper — uses system tesseract via child_process
+// ---------------------------------------------------------------------------
+
+interface OCRWord { text: string; x: number; y: number; width: number; height: number; confidence: number; }
+interface OCRResult { text: string; words: OCRWord[]; }
+
+async function runOCR(imageBuffer: Buffer): Promise<OCRResult> {
+  const tmpIn = join(tmpdir(), `ocr-${Date.now()}.png`);
+  const tmpOut = join(tmpdir(), `ocr-${Date.now()}`);
+  writeFileSync(tmpIn, imageBuffer);
+
+  return new Promise((resolve, reject) => {
+    execFile("tesseract", [tmpIn, tmpOut, "--tsv"], (err) => {
+      try { unlinkSync(tmpIn); } catch {}
+      if (err) { reject(err); return; }
+
+      const tsv = readFileSync(tmpOut + ".tsv", "utf-8");
+      try { unlinkSync(tmpOut + ".tsv"); } catch {}
+
+      const lines = tsv.trim().split("\n").slice(1);
+      const words: OCRWord[] = [];
+      const textParts: string[] = [];
+
+      for (const line of lines) {
+        const cols = line.split("\t");
+        const conf = parseInt(cols[10]);
+        const text = cols[11]?.trim();
+        if (conf > 0 && text) {
+          words.push({ text, x: parseInt(cols[6]), y: parseInt(cols[7]), width: parseInt(cols[8]), height: parseInt(cols[9]), confidence: conf });
+          textParts.push(text);
+        }
+      }
+      resolve({ text: textParts.join(" "), words });
+    });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Session Manager — each session gets its own Xvfb, x11vnc, and Chromium
@@ -24,7 +99,9 @@ interface BrowserSession {
   browser: Browser;
   context: BrowserContext;
   page: Page;
-  consoleLogs: string[];
+  pages: Page[];
+  activePageIndex: number;
+  logs: SessionLogStore;
   xvfb: ChildProcess;
   x11vnc: ChildProcess;
   createdAt: Date;
@@ -72,14 +149,79 @@ async function createBrowserSession(): Promise<BrowserSession> {
     browser,
     context,
     page,
-    consoleLogs: [],
+    pages: [page],
+    activePageIndex: 0,
+    logs: createLogStore(),
     xvfb,
     x11vnc,
     createdAt: new Date(),
   };
 
-  page.on("console", (msg) => {
-    session.consoleLogs.push(`[${msg.type()}] ${msg.text()}`);
+  // Wire up structured log listeners for all event types
+  const wirePageLogListeners = (p: Page) => {
+    p.on("console", (msg) => {
+      addLog(session.logs, {
+        category: "console",
+        level: msg.type() as LogEntry["level"],
+        message: msg.text(),
+        metadata: { location: msg.location() },
+      });
+    });
+
+    p.on("pageerror", (error) => {
+      addLog(session.logs, {
+        category: "pageerror",
+        level: "error",
+        message: error.message,
+        metadata: { stack: error.stack, name: error.name },
+      });
+    });
+
+    p.on("request", (request) => {
+      addLog(session.logs, {
+        category: "network",
+        level: "info",
+        message: `→ ${request.method()} ${request.url()}`,
+        metadata: {
+          method: request.method(),
+          url: request.url(),
+          resourceType: request.resourceType(),
+        },
+      });
+    });
+
+    p.on("response", (response) => {
+      addLog(session.logs, {
+        category: "network",
+        level: response.status() >= 400 ? "error" : "info",
+        message: `← ${response.status()} ${response.url()}`,
+        metadata: {
+          status: response.status(),
+          statusText: response.statusText(),
+          url: response.url(),
+        },
+      });
+    });
+
+    p.on("requestfailed", (request) => {
+      addLog(session.logs, {
+        category: "network",
+        level: "error",
+        message: `✗ ${request.method()} ${request.url()} — ${request.failure()?.errorText}`,
+        metadata: {
+          method: request.method(),
+          url: request.url(),
+          error: request.failure()?.errorText,
+        },
+      });
+    });
+  };
+
+  wirePageLogListeners(page);
+
+  context.on("page", (newPage) => {
+    session.pages.push(newPage);
+    wirePageLogListeners(newPage);
   });
 
   browserSessions.set(id, session);
@@ -233,10 +375,27 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
 
   // ---- Content Extraction --------------------------------------------------
 
-  server.tool("screenshot", {}, async () => {
+  server.tool("screenshot", {
+    selector: z.string().optional().describe("CSS selector to screenshot a specific element"),
+    fullPage: z.boolean().optional().default(true).describe("Capture full scrollable page (ignored if selector provided)"),
+    ocr: z.boolean().optional().default(false).describe("Extract text via OCR and include in response"),
+  }, async ({ selector, fullPage, ocr }) => {
     try {
-      const buf = await getPage().screenshot({ fullPage: true });
-      return { content: [{ type: "image", data: buf.toString("base64"), mimeType: "image/png" }] };
+      const page = getPage();
+      const buf = selector
+        ? await page.locator(selector).first().screenshot()
+        : await page.screenshot({ fullPage });
+
+      const content: ({ type: "image"; data: string; mimeType: string } | { type: "text"; text: string })[] = [
+        { type: "image" as const, data: buf.toString("base64"), mimeType: "image/png" },
+      ];
+
+      if (ocr) {
+        const ocrResult = await runOCR(buf);
+        content.push({ type: "text" as const, text: JSON.stringify(ocrResult) });
+      }
+
+      return { content };
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
@@ -272,10 +431,92 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
+  // ---- Logging tools -------------------------------------------------------
+
+  server.tool("get_logs", {
+    category: z.enum(["console", "network", "pageerror", "performance", "all"]).optional().default("all"),
+    level: z.enum(["debug", "info", "warn", "error", "log", "all"]).optional().default("all"),
+    since: z.number().optional().describe("Return logs after this sequence ID (cursor for pagination)"),
+    limit: z.number().int().min(1).max(500).optional().default(100),
+    urlFilter: z.string().optional().describe("Filter network logs by URL substring"),
+  }, async ({ category, level, since, limit, urlFilter }) => {
+    try {
+      const session = getSession();
+      let logs = session.logs.entries;
+
+      if (since !== undefined) logs = logs.filter(e => e.id > since);
+      if (category !== "all") logs = logs.filter(e => e.category === category);
+      if (level !== "all") logs = logs.filter(e => e.level === level);
+      if (urlFilter) logs = logs.filter(e => e.category === "network" && e.message.includes(urlFilter));
+
+      logs = logs.slice(-limit);
+
+      return { content: [{ type: "text", text: JSON.stringify({
+        logs,
+        cursor: logs.length ? logs[logs.length - 1].id : (since ?? 0),
+        total: session.logs.entries.length,
+        hint: "Pass 'since' with the cursor value to get only new logs next time",
+      }, null, 2) }] };
+    } catch (e: unknown) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
+  });
+
+  // Backward compatibility
   server.tool("get_console_logs", {}, async () => {
-    const s = getSession();
-    const logs = s.consoleLogs.splice(0, s.consoleLogs.length);
-    return { content: [{ type: "text", text: logs.length ? logs.join("\n") : "(no console logs)" }] };
+    try {
+      const session = getSession();
+      const consoleLogs = session.logs.entries
+        .filter(e => e.category === "console")
+        .slice(-100)
+        .map(e => `[${e.level}] ${e.message}`);
+      return { content: [{ type: "text", text: consoleLogs.length ? consoleLogs.join("\n") : "(no console logs)" }] };
+    } catch (e: unknown) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
+  });
+
+  server.tool("get_errors", {
+    since: z.number().optional().describe("Return errors after this sequence ID"),
+  }, async ({ since }) => {
+    try {
+      const session = getSession();
+      let errors = session.logs.entries.filter(e =>
+        e.category === "pageerror" ||
+        e.level === "error" ||
+        (e.category === "network" && e.metadata?.status && (e.metadata.status as number) >= 400)
+      );
+      if (since !== undefined) errors = errors.filter(e => e.id > since);
+      errors = errors.slice(-100);
+
+      return { content: [{ type: "text", text: errors.length
+        ? JSON.stringify({ errors, cursor: errors[errors.length - 1].id }, null, 2)
+        : JSON.stringify({ errors: [], message: "No errors found" })
+      }] };
+    } catch (e: unknown) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
+  });
+
+  server.tool("get_network_log", {
+    urlFilter: z.string().optional(),
+    statusFilter: z.number().optional().describe("Filter by HTTP status code"),
+    errorsOnly: z.boolean().optional().default(false),
+    limit: z.number().int().min(1).max(200).optional().default(50),
+  }, async ({ urlFilter, statusFilter, errorsOnly, limit }) => {
+    try {
+      const session = getSession();
+      let logs = session.logs.entries.filter(e => e.category === "network");
+
+      if (urlFilter) logs = logs.filter(e => e.message.includes(urlFilter));
+      if (statusFilter) logs = logs.filter(e => e.metadata?.status === statusFilter);
+      if (errorsOnly) logs = logs.filter(e => e.level === "error");
+
+      logs = logs.slice(-limit);
+      return { content: [{ type: "text", text: JSON.stringify(logs, null, 2) }] };
+    } catch (e: unknown) {
+      return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true };
+    }
   });
 
   // ---- Waiting -------------------------------------------------------------
@@ -290,6 +531,54 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
   server.tool("wait", { ms: z.number().positive().max(30000) }, async ({ ms }) => {
     await sleep(ms);
     return { content: [{ type: "text", text: `Waited ${ms}ms` }] };
+  });
+
+  // ---- Perception tools -----------------------------------------------------
+
+  server.tool("get_accessibility_tree", {
+    selector: z.string().optional().describe("CSS selector to scope the tree to a specific element"),
+  }, async ({ selector }) => {
+    try {
+      const page = getPage();
+      const locator = selector ? page.locator(selector).first() : page.locator(":root");
+      const snapshot = await locator.ariaSnapshot();
+      return { content: [{ type: "text", text: snapshot }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("click_at_coordinates", {
+    x: z.number().describe("X pixel coordinate"),
+    y: z.number().describe("Y pixel coordinate"),
+    button: z.enum(["left", "right", "middle"]).optional().default("left"),
+    clickCount: z.number().int().min(1).max(3).optional().default(1),
+  }, async ({ x, y, button, clickCount }) => {
+    try {
+      await getPage().mouse.click(x, y, { button, clickCount });
+      return { content: [{ type: "text", text: `Clicked at (${x}, ${y}) with ${button} button x${clickCount}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("ocr", {
+    structured: z.boolean().optional().default(false).describe("Return word-level bounding boxes with coordinates"),
+  }, async ({ structured }) => {
+    try {
+      const buf = await getPage().screenshot({ fullPage: true });
+      const result = await runOCR(buf);
+      if (structured) {
+        return { content: [{ type: "text", text: JSON.stringify(result.words, null, 2) }] };
+      }
+      return { content: [{ type: "text", text: result.text }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("drag_and_drop", {
+    source: z.string().describe("CSS selector for drag source"),
+    target: z.string().describe("CSS selector for drop target"),
+  }, async ({ source, target }) => {
+    try {
+      await getPage().dragAndDrop(source, target);
+      return { content: [{ type: "text", text: `Dragged ${source} to ${target}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
   return server;
@@ -342,6 +631,34 @@ app.delete("/api/sessions/:id", async (req, res) => {
   const ok = await destroyBrowserSession(req.params.id);
   if (!ok) return res.status(404).json({ error: "Session not found" });
   res.json({ ok: true });
+});
+
+// --- SSE log streaming endpoint -----------------------------------------------
+
+app.get("/api/sessions/:id/logs/stream", (req, res) => {
+  const session = browserSessions.get(req.params.id);
+  if (!session) return res.status(404).json({ error: "Session not found" });
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  // Send recent logs
+  for (const entry of session.logs.entries.slice(-50)) {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  }
+
+  // Subscribe to new logs
+  const listener = (entry: LogEntry) => {
+    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+  };
+  session.logs.listeners.push(listener);
+
+  req.on("close", () => {
+    const idx = session.logs.listeners.indexOf(listener);
+    if (idx >= 0) session.logs.listeners.splice(idx, 1);
+  });
 });
 
 // --- Tunnel key endpoint (for CLI auto-setup) --------------------------------
