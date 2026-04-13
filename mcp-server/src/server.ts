@@ -1234,6 +1234,162 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
+  // ---------------------------------------------------------------------------
+  // HAR recording & network capture tools
+  // ---------------------------------------------------------------------------
+
+  server.tool("start_har_recording", {}, async () => {
+    try {
+      const session = getSession();
+      if (session.isRecording) throw new Error("Already recording");
+
+      const harPath = `/tmp/har/${session.id}-${Date.now()}.har`;
+      mkdirSync("/tmp/har", { recursive: true });
+
+      const harEntries: NonNullable<BrowserSession["harEntries"]> = [];
+      const requestTimings = new Map<string, number>();
+
+      const requestHandler = (request: any) => {
+        requestTimings.set(request.url() + request.method(), Date.now());
+      };
+
+      const responseHandler = async (response: any) => {
+        try {
+          const startTime = requestTimings.get(response.url() + response.request().method()) || Date.now();
+          const reqHeaders = Object.entries(response.request().headers()).map(([name, value]) => ({ name, value: value as string }));
+          const resHeaders = Object.entries(response.headers()).map(([name, value]) => ({ name, value: value as string }));
+
+          let bodyText: string | undefined;
+          const mimeType = response.headers()["content-type"] || "";
+          try {
+            if (mimeType.includes("json") || mimeType.includes("text") || mimeType.includes("xml") || mimeType.includes("javascript") || mimeType.includes("css")) {
+              const body = await response.body();
+              bodyText = body.toString("utf-8").slice(0, 50000);
+            }
+          } catch {}
+
+          harEntries.push({
+            startedDateTime: new Date(startTime).toISOString(),
+            time: Date.now() - startTime,
+            request: {
+              method: response.request().method(),
+              url: response.url(),
+              headers: reqHeaders,
+              ...(response.request().postData() ? { postData: { text: response.request().postData()!, mimeType: response.request().headers()["content-type"] || "" } } : {}),
+            },
+            response: {
+              status: response.status(),
+              statusText: response.statusText(),
+              headers: resHeaders,
+              content: {
+                size: parseInt(response.headers()["content-length"] || "0") || 0,
+                mimeType,
+                ...(bodyText ? { text: bodyText } : {}),
+              },
+            },
+          });
+        } catch {}
+      };
+
+      session.harEntries = harEntries;
+      session.harRequestHandler = requestHandler;
+      session.harResponseHandler = responseHandler;
+
+      for (const p of session.pages) {
+        if (!p.isClosed()) {
+          p.on("request", requestHandler);
+          p.on("response", responseHandler);
+        }
+      }
+
+      session.isRecording = true;
+      session.harRecordingPath = harPath;
+
+      return { content: [{ type: "text", text: "HAR recording started. Use stop_har_recording to get the HAR file." }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("stop_har_recording", {
+    format: z.enum(["full", "summary"]).optional().default("full"),
+  }, async ({ format }) => {
+    try {
+      const session = getSession();
+      if (!session.isRecording) throw new Error("Not recording");
+
+      const harEntries = session.harEntries || [];
+      const requestHandler = session.harRequestHandler;
+      const responseHandler = session.harResponseHandler;
+
+      for (const p of session.pages) {
+        if (!p.isClosed()) {
+          if (requestHandler) p.removeListener("request", requestHandler);
+          if (responseHandler) p.removeListener("response", responseHandler);
+        }
+      }
+
+      session.isRecording = false;
+      session.harEntries = undefined;
+      session.harRequestHandler = undefined;
+      session.harResponseHandler = undefined;
+
+      if (format === "summary") {
+        const summary = harEntries.map((e) => ({
+          method: e.request.method,
+          url: e.request.url,
+          status: e.response.status,
+          size: e.response.content.size,
+          time: e.time,
+        }));
+        return { content: [{ type: "text", text: JSON.stringify(summary, null, 2) }] };
+      }
+
+      const har = {
+        log: {
+          version: "1.2",
+          creator: { name: "rembro", version: "0.3.0" },
+          entries: harEntries,
+        },
+      };
+
+      if (session.harRecordingPath) {
+        writeFileSync(session.harRecordingPath, JSON.stringify(har, null, 2));
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(har, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("get_response_body", {
+    url: z.string().describe("URL pattern to match (substring match)"),
+    timeout: z.number().int().positive().max(30000).optional().default(10000),
+  }, async ({ url, timeout }) => {
+    try {
+      const page = getPage();
+
+      const response = await page.waitForResponse(
+        (resp: any) => resp.url().includes(url),
+        { timeout }
+      );
+
+      const status = response.status();
+      const headers = response.headers();
+      let body: string;
+      try {
+        const buf = await response.body();
+        const contentType = headers["content-type"] || "";
+        if (contentType.includes("json") || contentType.includes("text") || contentType.includes("xml")) {
+          body = buf.toString("utf-8");
+        } else {
+          body = buf.toString("base64");
+        }
+      } catch {
+        body = "(body unavailable)";
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify({ url: response.url(), status, headers, body }, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
   return server;
 }
 
