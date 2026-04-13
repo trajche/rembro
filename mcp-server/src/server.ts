@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, unlinkSync, mkdirSync, rmSync, statSync } 
 import { tmpdir } from "os";
 import { join } from "path";
 import net from "net";
-import { chromium, firefox, webkit, type Browser, type BrowserContext, type Page, type BrowserType } from "playwright";
+import { chromium, firefox, webkit, type Browser, type BrowserContext, type Page, type BrowserType, type Frame } from "playwright";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { WebSocketServer, WebSocket } from "ws";
@@ -147,6 +147,7 @@ interface BrowserSession {
   pages: Page[];
   activePageIndex: number;
   logs: SessionLogStore;
+  activeFrameSelector?: string; // CSS selector of active iframe, undefined = top-level
   downloads: DownloadInfo[];
   nextDownloadId: number;
   isRecording: boolean;
@@ -159,6 +160,8 @@ interface BrowserSession {
   }>;
   harRequestHandler?: (request: any) => void;
   harResponseHandler?: (response: any) => void;
+  activeRoutes: Array<{ id: number; pattern: string; type: "mock" | "block" }>;
+  nextRouteId: number;
   xvfb: ChildProcess;
   x11vnc: ChildProcess;
   createdAt: Date;
@@ -274,6 +277,9 @@ async function createBrowserSession(opts: CreateSessionOpts = {}): Promise<Brows
     logs: createLogStore(),
     downloads: [],
     nextDownloadId: 1,
+    isRecording: false,
+    activeRoutes: [],
+    nextRouteId: 1,
     xvfb,
     x11vnc,
     createdAt: new Date(),
@@ -400,6 +406,11 @@ async function destroyBrowserSession(id: string): Promise<boolean> {
   // Clean up downloads
   try { rmSync(`/tmp/downloads/${id}`, { recursive: true, force: true }); } catch {}
 
+  // Clean up HAR recording file
+  if (session.harRecordingPath) {
+    try { rmSync(session.harRecordingPath, { force: true }); } catch {}
+  }
+
   console.log(`Session ${id.slice(0, 8)} destroyed`);
   return true;
 }
@@ -445,6 +456,21 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
     const s = getSession();
     if (s.page.isClosed()) throw new Error("Page is closed");
     return s.page;
+  };
+
+  const resolveFrame = async (frameSelector?: string): Promise<Frame> => {
+    const page = getPage();
+    if (!frameSelector) return page.mainFrame();
+    const elementHandle = await page.locator(frameSelector).first().elementHandle();
+    if (!elementHandle) throw new Error(`iframe not found: ${frameSelector}`);
+    const frame = await elementHandle.contentFrame();
+    if (!frame) throw new Error(`Could not access frame content for: ${frameSelector}`);
+    return frame;
+  };
+
+  const getActiveFrame = async (): Promise<Frame> => {
+    const session = getSession();
+    return resolveFrame(session.activeFrameSelector);
   };
 
   // ---- Session management --------------------------------------------------
@@ -601,13 +627,19 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
   // ---- Interaction ---------------------------------------------------------
 
   server.tool("click", { selector: z.string() }, async ({ selector }) => {
-    try { await getPage().click(selector); return { content: [{ type: "text", text: `Clicked: ${selector}` }] }; }
-    catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+    try {
+      const frame = await getActiveFrame();
+      await frame.locator(selector).click();
+      return { content: [{ type: "text", text: `Clicked: ${selector}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
   server.tool("fill", { selector: z.string(), value: z.string() }, async ({ selector, value }) => {
-    try { await getPage().fill(selector, value); return { content: [{ type: "text", text: `Filled ${selector}` }] }; }
-    catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+    try {
+      const frame = await getActiveFrame();
+      await frame.locator(selector).fill(value);
+      return { content: [{ type: "text", text: `Filled ${selector}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
   server.tool("type", { text: z.string() }, async ({ text }) => {
@@ -621,13 +653,103 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
   });
 
   server.tool("hover", { selector: z.string() }, async ({ selector }) => {
-    try { await getPage().hover(selector); return { content: [{ type: "text", text: `Hovered: ${selector}` }] }; }
-    catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+    try {
+      const frame = await getActiveFrame();
+      await frame.locator(selector).hover();
+      return { content: [{ type: "text", text: `Hovered: ${selector}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
   server.tool("select_option", { selector: z.string(), value: z.string() }, async ({ selector, value }) => {
-    try { await getPage().selectOption(selector, value); return { content: [{ type: "text", text: `Selected "${value}"` }] }; }
-    catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+    try {
+      const frame = await getActiveFrame();
+      await frame.locator(selector).selectOption(value);
+      return { content: [{ type: "text", text: `Selected "${value}"` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  // ---- iframe support -------------------------------------------------------
+
+  server.tool("list_frames", {}, async () => {
+    try {
+      const page = getPage();
+      const frames = page.frames();
+      const frameInfos = frames.map((f, i) => ({
+        index: i,
+        name: f.name() || "(unnamed)",
+        url: f.url(),
+        isMain: f === page.mainFrame(),
+        isDetached: f.isDetached(),
+      }));
+      return { content: [{ type: "text", text: JSON.stringify(frameInfos, null, 2) }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("switch_frame", {
+    selector: z.string().optional().describe("CSS selector of the <iframe> element. Omit to return to main frame."),
+  }, async ({ selector }) => {
+    try {
+      const session = getSession();
+      if (!selector) {
+        session.activeFrameSelector = undefined;
+        return { content: [{ type: "text", text: "Switched to main frame" }] };
+      }
+      // Verify the iframe exists and is accessible
+      const page = getPage();
+      const elementHandle = await page.locator(selector).first().elementHandle();
+      if (!elementHandle) throw new Error(`iframe not found: ${selector}`);
+      const frame = await elementHandle.contentFrame();
+      if (!frame) throw new Error(`Could not access frame content for: ${selector}`);
+      session.activeFrameSelector = selector;
+      return { content: [{ type: "text", text: `Switched to frame: ${selector} (${frame.url()})` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("frame_click", {
+    frame: z.string().describe("CSS selector of the <iframe> element"),
+    selector: z.string().describe("CSS selector inside the frame"),
+  }, async ({ frame, selector }) => {
+    try {
+      const f = await resolveFrame(frame);
+      await f.locator(selector).click();
+      return { content: [{ type: "text", text: `Clicked ${selector} in frame ${frame}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("frame_fill", {
+    frame: z.string().describe("CSS selector of the <iframe> element"),
+    selector: z.string().describe("CSS selector inside the frame"),
+    value: z.string(),
+  }, async ({ frame, selector, value }) => {
+    try {
+      const f = await resolveFrame(frame);
+      await f.locator(selector).fill(value);
+      return { content: [{ type: "text", text: `Filled ${selector} in frame ${frame}` }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("frame_get_text", {
+    frame: z.string().describe("CSS selector of the <iframe> element"),
+    selector: z.string().optional().describe("CSS selector inside the frame (default: body)"),
+  }, async ({ frame, selector }) => {
+    try {
+      const f = await resolveFrame(frame);
+      const text = await f.locator(selector || "body").innerText();
+      return { content: [{ type: "text", text }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
+  });
+
+  server.tool("frame_get_html", {
+    frame: z.string().describe("CSS selector of the <iframe> element"),
+    selector: z.string().optional().describe("CSS selector inside the frame"),
+  }, async ({ frame, selector }) => {
+    try {
+      const f = await resolveFrame(frame);
+      const html = selector
+        ? await f.locator(selector).first().evaluate((el) => el.outerHTML)
+        : await f.content();
+      return { content: [{ type: "text", text: html }] };
+    } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
   // ---- Content Extraction --------------------------------------------------
@@ -658,23 +780,24 @@ function createMcpServer(mcpSessionId: string, browserSessionId: string): McpSer
 
   server.tool("get_html", { selector: z.string().optional() }, async ({ selector }) => {
     try {
-      const p = getPage();
-      const html = selector ? await p.locator(selector).first().evaluate((el) => el.outerHTML) : await p.content();
+      const frame = await getActiveFrame();
+      const html = selector ? await frame.locator(selector).first().evaluate((el) => el.outerHTML) : await frame.content();
       return { content: [{ type: "text", text: html }] };
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
   server.tool("get_text", { selector: z.string().optional() }, async ({ selector }) => {
     try {
-      const p = getPage();
-      const text = selector ? await p.locator(selector).first().innerText() : await p.locator("body").innerText();
+      const frame = await getActiveFrame();
+      const text = selector ? await frame.locator(selector).first().innerText() : await frame.locator("body").innerText();
       return { content: [{ type: "text", text }] };
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
 
   server.tool("get_attribute", { selector: z.string(), attribute: z.string() }, async ({ selector, attribute }) => {
     try {
-      const val = await getPage().locator(selector).first().getAttribute(attribute);
+      const frame = await getActiveFrame();
+      const val = await frame.locator(selector).first().getAttribute(attribute);
       return { content: [{ type: "text", text: val ?? "(null)" }] };
     } catch (e: unknown) { return { content: [{ type: "text", text: `Error: ${(e as Error).message}` }], isError: true }; }
   });
