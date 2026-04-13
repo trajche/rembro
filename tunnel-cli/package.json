@@ -1,0 +1,12 @@
+{
+  "name": "remotebrowser-tunnel",
+  "version": "0.1.0",
+  "description": "Tunnel local services to RemoteBrowserMCP",
+  "bin": {
+    "remotebrowser-tunnel": "./bin/tunnel.mjs"
+  },
+  "type": "module",
+  "files": ["bin/"],
+  "keywords": ["mcp", "browser", "tunnel", "remote"],
+  "license": "MIT"
+}

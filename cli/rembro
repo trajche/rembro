@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOST="${REMBRO_HOST:-rembro.digitalno.de}"
+BASE="${REMBRO_URL:-https://rembro.digitalno.de}"
+SSH_PORT=2222
+KEY_FILE="${HOME}/.rembro/tunnel_key"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+usage() {
+  echo ""
+  echo -e "${BOLD}rembro${NC} — Remote Browser MCP"
+  echo ""
+  echo -e "  ${CYAN}rembro expose <port>${NC}    Expose a local port to the remote browser"
+  echo -e "  ${CYAN}rembro session${NC}          Create a browser session (no tunnel)"
+  echo -e "  ${CYAN}rembro sessions${NC}         List active sessions"
+  echo -e "  ${CYAN}rembro kill <id>${NC}         Kill a session"
+  echo -e "  ${CYAN}rembro setup${NC}            Download tunnel key"
+  echo ""
+  echo "  Options:"
+  echo "    -r, --remote-port PORT   Port inside the remote browser (default: same as local)"
+  echo "    -s, --session ID         Attach to existing session instead of creating new one"
+  echo ""
+  echo "  Examples:"
+  echo "    rembro expose 3000                  # expose localhost:3000"
+  echo "    rembro expose 8080 -r 3000          # local:8080 -> remote:3000"
+  echo "    rembro expose 3000 -s abc123...     # reuse existing session"
+  echo ""
+  echo "  Install:"
+  echo "    curl -sL ${BASE}/cli -o /usr/local/bin/rembro && chmod +x /usr/local/bin/rembro"
+  echo ""
+}
+
+ensure_key() {
+  if [ -f "$KEY_FILE" ]; then return 0; fi
+  echo -e "${CYAN}Downloading tunnel key...${NC}"
+  mkdir -p "$HOME/.rembro"
+  curl -sf "$BASE/api/tunnel-key" -o "$KEY_FILE" || { echo -e "${RED}Failed to download tunnel key${NC}"; exit 1; }
+  chmod 600 "$KEY_FILE"
+  echo -e "${GREEN}Key saved to $KEY_FILE${NC}"
+}
+
+cmd_setup() {
+  ensure_key
+  echo -e "${GREEN}Setup complete.${NC}"
+}
+
+cmd_session() {
+  local SESSION
+  SESSION=$(curl -sf -X POST "$BASE/api/sessions")
+  local SID VNC
+  SID=$(echo "$SESSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "$SESSION" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+  VNC=$(echo "$SESSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['vncUrl'])" 2>/dev/null || echo "$SESSION" | grep -o '"vncUrl":"[^"]*"' | head -1 | cut -d'"' -f4)
+  echo -e "${GREEN}Session created${NC}"
+  echo -e "  ID:  ${BOLD}$SID${NC}"
+  echo -e "  VNC: ${CYAN}$VNC${NC}"
+}
+
+cmd_sessions() {
+  curl -sf "$BASE/api/sessions" | python3 -m json.tool 2>/dev/null || curl -sf "$BASE/api/sessions"
+}
+
+cmd_kill() {
+  local ID="$1"
+  curl -sf -X DELETE "$BASE/api/sessions/$ID" > /dev/null
+  echo -e "${GREEN}Session ${ID:0:8} killed${NC}"
+}
+
+cmd_expose() {
+  local LOCAL_PORT="$1"
+  local REMOTE_PORT="${2:-$LOCAL_PORT}"
+  local SESSION_ID="${3:-}"
+
+  if [ -z "$LOCAL_PORT" ]; then echo -e "${RED}Error: port required${NC}"; usage; exit 1; fi
+
+  ensure_key
+
+  # Create session if not provided
+  local VNC
+  if [ -z "$SESSION_ID" ]; then
+    echo -e "${CYAN}Creating browser session...${NC}"
+    local SESSION
+    SESSION=$(curl -sf -X POST "$BASE/api/sessions")
+    SESSION_ID=$(echo "$SESSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])" 2>/dev/null || echo "$SESSION" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    VNC=$(echo "$SESSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['vncUrl'])" 2>/dev/null || echo "$SESSION" | grep -o '"vncUrl":"[^"]*"' | head -1 | cut -d'"' -f4)
+  else
+    VNC="$BASE/vnc/$SESSION_ID"
+  fi
+
+  echo ""
+  echo -e "${BOLD}RemoteBrowserMCP${NC}"
+  echo -e "  Session: ${BOLD}${SESSION_ID:0:8}...${NC}"
+  echo -e "  VNC:     ${CYAN}$VNC${NC}"
+  echo -e "  Tunnel:  localhost:$LOCAL_PORT → remote::$REMOTE_PORT"
+  echo ""
+  echo -e "  The remote browser can reach ${BOLD}http://localhost:$REMOTE_PORT${NC}"
+  echo -e "  Press ${BOLD}Ctrl+C${NC} to stop"
+  echo ""
+
+  trap 'echo ""; echo -e "${CYAN}Tunnel closed.${NC}"' EXIT INT TERM
+
+  ssh -N \
+    -R "0.0.0.0:$REMOTE_PORT:localhost:$LOCAL_PORT" \
+    -p $SSH_PORT \
+    -i "$KEY_FILE" \
+    -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    -o LogLevel=ERROR \
+    -o ServerAliveInterval=30 \
+    -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes \
+    "tunnel@$HOST"
+}
+
+# --- Parse arguments ---
+CMD="${1:-}"
+shift 2>/dev/null || true
+
+case "$CMD" in
+  expose)
+    LOCAL_PORT="" REMOTE_PORT="" SESSION_ID=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -r|--remote-port) REMOTE_PORT="$2"; shift 2 ;;
+        -s|--session) SESSION_ID="$2"; shift 2 ;;
+        *) if [ -z "$LOCAL_PORT" ]; then LOCAL_PORT="$1"; else echo "Unknown arg: $1"; exit 1; fi; shift ;;
+      esac
+    done
+    cmd_expose "$LOCAL_PORT" "${REMOTE_PORT:-$LOCAL_PORT}" "$SESSION_ID"
+    ;;
+  session)  cmd_session ;;
+  sessions) cmd_sessions ;;
+  kill)     cmd_kill "${1:?session ID required}" ;;
+  setup)    cmd_setup ;;
+  *)        usage ;;
+esac

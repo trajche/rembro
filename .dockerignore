@@ -1,0 +1,9 @@
+node_modules
+dist
+data
+*.md
+research-*
+spec-*
+tunnel-cli
+.git
+.claude

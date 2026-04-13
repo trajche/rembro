@@ -1,0 +1,8 @@
+rembro.digitalno.de {
+	reverse_proxy browser:3000
+}
+
+vnc.rembro.digitalno.de {
+	redir / https://rembro.digitalno.de 302
+	reverse_proxy browser:3000
+}

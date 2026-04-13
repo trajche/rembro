@@ -1,0 +1,35 @@
+services:
+  browser:
+    build:
+      context: .
+      dockerfile: docker/browser/Dockerfile
+    ports:
+      - "2222:2222"
+    environment:
+      - DISPLAY=:99
+    volumes:
+      - ./data/ssh:/home/tunnel/.ssh
+      - ./data/ssh:/data/ssh:ro
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 4g
+    shm_size: 2g
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    depends_on:
+      - browser
+
+volumes:
+  caddy_data:
+  caddy_config:
