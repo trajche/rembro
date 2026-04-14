@@ -1728,9 +1728,33 @@ app.get("/docs", (_req, res) => {
 <div id="content">Loading…</div>
 <script type="module">
   import { marked } from "https://cdn.jsdelivr.net/npm/marked/lib/marked.esm.js";
+
+  // Slugify heading text the same way GitHub does so anchor links like
+  // #quick-start, #creating-sessions etc. actually navigate.
+  const slugify = (s) => s
+    .toLowerCase()
+    .replace(/<[^>]+>/g, "")
+    .replace(/[^\w\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-");
+
+  const renderer = new marked.Renderer();
+  renderer.heading = ({ tokens, depth }) => {
+    const text = tokens.map(t => t.raw || t.text || "").join("");
+    const id = slugify(text);
+    return \`<h\${depth} id="\${id}"><a href="#\${id}" style="color:inherit;text-decoration:none">\${marked.parseInline(text)}</a></h\${depth}>\`;
+  };
+  marked.use({ renderer });
+
   const res = await fetch("/api.md");
   const md = await res.text();
   document.getElementById("content").innerHTML = marked.parse(md);
+
+  // Jump to hash after render
+  if (location.hash) {
+    const el = document.getElementById(location.hash.slice(1));
+    if (el) el.scrollIntoView();
+  }
 </script>
 </body></html>`);
 });
@@ -1801,19 +1825,6 @@ app.get("/", (_req, res) => {
       &nbsp;<a class="btn" href="/api.md" style="background:#444">Raw Markdown</a>
       &nbsp;<a class="btn" href="https://github.com/trajche/rembro" style="background:#444">GitHub</a>
     </p>
-  </div>
-
-  <div class="card">
-    <h3>REST API — Session Management</h3>
-    <table>
-      <tr><td><code>POST /api/sessions</code></td><td>Create a new browser session (accepts JSON body with browser, viewport, locale, etc.)</td></tr>
-      <tr><td><code>GET /api/sessions</code></td><td>List all sessions</td></tr>
-      <tr><td><code>GET /api/sessions/:id</code></td><td>Get session details</td></tr>
-      <tr><td><code>DELETE /api/sessions/:id</code></td><td>Destroy a session</td></tr>
-      <tr><td><code>DELETE /api/sessions</code></td><td>Destroy all sessions</td></tr>
-      <tr><td><code>GET /api/sessions/:id/logs/stream</code></td><td>SSE live log stream</td></tr>
-      <tr><td><code>GET /health</code></td><td>Server health check</td></tr>
-    </table>
   </div>
 
 <script>
