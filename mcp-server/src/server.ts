@@ -1729,30 +1729,33 @@ app.get("/docs", (_req, res) => {
 <script type="module">
   import { marked } from "https://cdn.jsdelivr.net/npm/marked/lib/marked.esm.js";
 
-  // Slugify heading text the same way GitHub does so anchor links like
-  // #quick-start, #creating-sessions etc. actually navigate.
   const slugify = (s) => s
     .toLowerCase()
-    .replace(/<[^>]+>/g, "")
-    .replace(/[^\w\s-]/g, "")
+    .replace(/[^\\w\\s-]/g, "")
     .trim()
-    .replace(/\s+/g, "-");
-
-  const renderer = new marked.Renderer();
-  renderer.heading = ({ tokens, depth }) => {
-    const text = tokens.map(t => t.raw || t.text || "").join("");
-    const id = slugify(text);
-    return \`<h\${depth} id="\${id}"><a href="#\${id}" style="color:inherit;text-decoration:none">\${marked.parseInline(text)}</a></h\${depth}>\`;
-  };
-  marked.use({ renderer });
+    .replace(/\\s+/g, "-");
 
   const res = await fetch("/api.md");
   const md = await res.text();
-  document.getElementById("content").innerHTML = marked.parse(md);
+  const content = document.getElementById("content");
+  content.innerHTML = marked.parse(md);
 
-  // Jump to hash after render
+  // Post-process: assign GitHub-style IDs to all headings
+  content.querySelectorAll("h1, h2, h3, h4, h5, h6").forEach((h) => {
+    const id = slugify(h.textContent);
+    h.id = id;
+    const link = document.createElement("a");
+    link.href = "#" + id;
+    link.style.color = "inherit";
+    link.style.textDecoration = "none";
+    link.innerHTML = h.innerHTML;
+    h.innerHTML = "";
+    h.appendChild(link);
+  });
+
+  // Scroll to hash after IDs exist
   if (location.hash) {
-    const el = document.getElementById(location.hash.slice(1));
+    const el = document.getElementById(decodeURIComponent(location.hash.slice(1)));
     if (el) el.scrollIntoView();
   }
 </script>
