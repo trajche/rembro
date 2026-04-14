@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Rembro is a remote browser MCP server. It runs real browsers (Chromium/Firefox/WebKit) inside a Docker container with Xvfb + x11vnc, exposing browser automation via 43 MCP tools over Streamable HTTP. Users watch the browser live through noVNC in their web browser.
+Rembro is a remote browser MCP server. It runs real browsers (Chromium/Firefox/WebKit) inside a Docker container with Xvfb + x11vnc, exposing browser automation via 60 MCP tools over Streamable HTTP. Users watch the browser live through noVNC in their web browser.
 
 ## Key Files
 

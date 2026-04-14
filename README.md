@@ -73,7 +73,7 @@ Your Machine                          Hetzner Server (rembro.digitalno.de)
 └──────────────┘                      └──────────────────────────┘
 ```
 
-## MCP Tools (43 total)
+## MCP Tools (60 total)
 
 ### Session Management
 | Tool | Description |
@@ -100,13 +100,13 @@ Your Machine                          Hetzner Server (rembro.digitalno.de)
 ### Interaction
 | Tool | Description |
 |------|-------------|
-| `click` | Click an element by CSS selector |
+| `click` | Click an element by CSS selector (iframe-aware) |
 | `click_at_coordinates` | Click at pixel coordinates (x, y) |
-| `fill` | Fill an input field |
+| `fill` | Fill an input field (iframe-aware) |
 | `type` | Type text via keyboard |
 | `press_key` | Press a key (Enter, Tab, Escape, etc.) |
-| `hover` | Hover over an element |
-| `select_option` | Select a dropdown option |
+| `hover` | Hover over an element (iframe-aware) |
+| `select_option` | Select a dropdown option (iframe-aware) |
 | `drag_and_drop` | Drag from one element to another |
 
 ### Content Extraction
@@ -115,9 +115,10 @@ Your Machine                          Hetzner Server (rembro.digitalno.de)
 | `screenshot` | Take a screenshot (full page, element, or with OCR text extraction) |
 | `ocr` | Extract text from the page via OCR with optional word-level bounding boxes |
 | `get_accessibility_tree` | Get the accessibility tree (semantic page structure for AI agents) |
-| `get_html` | Get page or element HTML |
-| `get_text` | Get text content of page or element |
-| `get_attribute` | Get an element's attribute value |
+| `get_html` | Get page or element HTML (iframe-aware) |
+| `get_text` | Get text content of page or element (iframe-aware) |
+| `get_attribute` | Get an element's attribute value (iframe-aware) |
+| `save_pdf` | Generate a PDF of the current page (Chromium only, via CDP) |
 
 ### JavaScript
 | Tool | Description |
@@ -131,6 +132,38 @@ Your Machine                          Hetzner Server (rembro.digitalno.de)
 | `get_console_logs` | Get browser console output (backward-compatible) |
 | `get_errors` | Get all errors (JS exceptions, console errors, HTTP 4xx/5xx) |
 | `get_network_log` | Get network requests/responses with URL and status filters |
+
+### Network Recording
+| Tool | Description |
+|------|-------------|
+| `start_har_recording` | Start recording all network traffic for HAR export |
+| `stop_har_recording` | Stop recording and return HAR 1.2 data (full or summary) |
+| `get_response_body` | Wait for and capture a specific response body by URL pattern |
+
+### Network Interception
+| Tool | Description |
+|------|-------------|
+| `mock_route` | Intercept requests matching a glob and return a custom response |
+| `block_route` | Block/abort requests matching a glob pattern |
+| `list_routes` | List active route interceptions |
+| `clear_routes` | Remove all route interceptions |
+
+### File Downloads
+| Tool | Description |
+|------|-------------|
+| `wait_for_download` | Trigger an action and capture the resulting download |
+| `get_downloads` | List all completed downloads for this session |
+| `get_download_content` | Get a downloaded file's content (base64 or text) |
+
+### iframes
+| Tool | Description |
+|------|-------------|
+| `list_frames` | List all frames in the page (name, URL, main/detached status) |
+| `switch_frame` | Set active frame for subsequent interaction tools (omit to return to main) |
+| `frame_click` | Click inside a specific iframe |
+| `frame_fill` | Fill an input inside a specific iframe |
+| `frame_get_text` | Get text content from inside a specific iframe |
+| `frame_get_html` | Get HTML from inside a specific iframe |
 
 ### Waiting
 | Tool | Description |
@@ -227,6 +260,15 @@ curl -N https://rembro.digitalno.de/api/sessions/<id>/logs/stream
 
 # Health check
 curl https://rembro.digitalno.de/health
+```
+
+## Features by Sprint
+
+### Sprint 1
+Core browser automation, multi-browser support (Chromium/Firefox/WebKit), 8 viewport presets, accessibility tree, OCR with bounding boxes, click-at-coordinates, cookies/storage management, multi-tab, auth state save/restore, structured logging with cursor pagination, network monitoring, session auto-cleanup (30min TTL).
+
+### Sprint 2
+File download capture, HAR recording and export, network request/response interception and mocking, iframe support (list, switch, interact), PDF generation via CDP.
 ```
 
 ## Self-Hosting
