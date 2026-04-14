@@ -1683,6 +1683,58 @@ rfb.addEventListener('disconnect', () => { document.getElementById('dot').classN
 // Serve noVNC static files
 app.use("/novnc", express.static("/usr/share/novnc"));
 
+// --- API documentation ------------------------------------------------------
+
+app.get("/api.md", (_req, res) => {
+  const paths = ["/app/API.md", "../API.md", "./API.md"];
+  for (const p of paths) {
+    try {
+      const md = readFileSync(p, "utf-8");
+      res.type("text/markdown").send(md);
+      return;
+    } catch { /* try next */ }
+  }
+  res.status(404).send("API.md not found");
+});
+
+app.get("/docs", (_req, res) => {
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html>
+<html><head><title>Rembro API Docs</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px; background: #0d1117; color: #c9d1d9; line-height: 1.6; }
+  h1, h2, h3, h4 { color: #58a6ff; margin-top: 1.5em; }
+  h1 { border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+  h2 { border-bottom: 1px solid #30363d; padding-bottom: 0.3em; }
+  a { color: #58a6ff; }
+  code { background: #161b22; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; color: #f0883e; }
+  pre { background: #161b22; padding: 16px; border-radius: 6px; overflow-x: auto; border: 1px solid #30363d; }
+  pre code { background: transparent; padding: 0; color: #c9d1d9; }
+  table { width: 100%; border-collapse: collapse; margin: 1em 0; }
+  th, td { padding: 8px 12px; text-align: left; border: 1px solid #30363d; }
+  th { background: #161b22; color: #8b949e; }
+  blockquote { border-left: 3px solid #58a6ff; padding-left: 1em; color: #8b949e; margin: 1em 0; }
+  hr { border: 0; border-top: 1px solid #30363d; margin: 2em 0; }
+  .nav { position: sticky; top: 0; background: #0d1117; padding: 12px 0; margin-bottom: 20px; border-bottom: 1px solid #30363d; }
+  .nav a { margin-right: 16px; }
+  #content img { max-width: 100%; }
+</style>
+</head><body>
+<div class="nav">
+  <a href="/">&larr; Dashboard</a>
+  <a href="/api.md">Raw Markdown</a>
+  <a href="https://github.com/trajche/rembro">GitHub</a>
+</div>
+<div id="content">Loading…</div>
+<script type="module">
+  import { marked } from "https://cdn.jsdelivr.net/npm/marked/lib/marked.esm.js";
+  const res = await fetch("/api.md");
+  const md = await res.text();
+  document.getElementById("content").innerHTML = marked.parse(md);
+</script>
+</body></html>`);
+});
+
 // --- Landing page / dashboard -----------------------------------------------
 
 app.get("/", (_req, res) => {
@@ -1742,12 +1794,25 @@ app.get("/", (_req, res) => {
   </div>
 
   <div class="card">
-    <h3>REST API</h3>
+    <h3>API Documentation</h3>
+    <p>Full API reference with payload examples for all 60 MCP tools + REST endpoints:</p>
+    <p>
+      <a class="btn" href="/docs">Browse API Docs</a>
+      &nbsp;<a class="btn" href="/api.md" style="background:#444">Raw Markdown</a>
+      &nbsp;<a class="btn" href="https://github.com/trajche/rembro" style="background:#444">GitHub</a>
+    </p>
+  </div>
+
+  <div class="card">
+    <h3>REST API — Session Management</h3>
     <table>
-      <tr><td><code>POST /api/sessions</code></td><td>Create a new browser session</td></tr>
+      <tr><td><code>POST /api/sessions</code></td><td>Create a new browser session (accepts JSON body with browser, viewport, locale, etc.)</td></tr>
       <tr><td><code>GET /api/sessions</code></td><td>List all sessions</td></tr>
       <tr><td><code>GET /api/sessions/:id</code></td><td>Get session details</td></tr>
       <tr><td><code>DELETE /api/sessions/:id</code></td><td>Destroy a session</td></tr>
+      <tr><td><code>DELETE /api/sessions</code></td><td>Destroy all sessions</td></tr>
+      <tr><td><code>GET /api/sessions/:id/logs/stream</code></td><td>SSE live log stream</td></tr>
+      <tr><td><code>GET /health</code></td><td>Server health check</td></tr>
     </table>
   </div>
 

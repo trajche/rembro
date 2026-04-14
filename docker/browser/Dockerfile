@@ -44,6 +44,10 @@ RUN chmod +x /usr/local/bin/generate-keys.sh
 # Copy CLI
 COPY cli/ /app/cli/
 
+# Copy docs (served at /api.md and /docs)
+COPY API.md /app/API.md
+COPY README.md /app/README.md
+
 # Build MCP server
 COPY mcp-server/ /app/mcp-server/
 WORKDIR /app/mcp-server
