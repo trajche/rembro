@@ -1,9 +1,11 @@
 node_modules
 dist
 data
-*.md
 research-*
 spec-*
+CONCEPT_DOCUMENT.md
+IMPLEMENTATION_PLAN.md
+CLAUDE.md
 tunnel-cli
 .git
 .claude
