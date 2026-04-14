@@ -8,6 +8,8 @@ Remote browser sessions controlled by AI agents via MCP, with live VNC viewing a
 
 Rembro gives AI agents (Claude Code, custom MCP clients) a real browser running on a remote server. The agent can navigate, click, fill forms, take screenshots, extract text, and more — while you watch live via VNC in your browser.
 
+**→ See [API.md](./API.md) for full API reference with payload examples.**
+
 It's useful for:
 - **Testing web apps** — point the AI at your local dev server through an SSH tunnel
 - **Web scraping/research** — let the AI browse the web and extract information
